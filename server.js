@@ -13,7 +13,6 @@ const API_BASE = 'https://api.alltalkpro.com/api/v1';
 const APP_URL = 'https://adorable-monstera-b10a64.netlify.app';
 
 // Store registered users (in production, use a database)
-// Format: { odhi0294 { email, encryptedPassword, smsAlertNumber, smsAlertFromNumberId, accessToken, tokenExpiry, lastMessageIds } }
 const registeredUsers = {};
 
 // Encrypt password
@@ -29,64 +28,74 @@ function decrypt(ciphertext) {
 
 // AllTalk API call helper
 async function apiCall(endpoint, accessToken, options = {}) {
+    const url = `${API_BASE}${endpoint}`;
     const headers = {
+        'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'Accept-Language': 'en',
         ...options.headers
     };
-    if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
     
-    const response = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
-    return response.json();
-}
-
-// Login to AllTalk and get access token
-async function loginUser(email, password) {
-    const response = await apiCall('/auth/sign-in', null, {
-        method: 'POST',
-        body: JSON.stringify({ email, password, remember_me: true })
-    });
-    
-    if (response.data?.tokens?.access_token) {
-        return {
-            accessToken: response.data.tokens.access_token,
-            refreshToken: response.data.tokens.refresh_token,
-            user: response.data.user
-        };
+    try {
+        const response = await fetch(url, { ...options, headers });
+        return await response.json();
+    } catch (err) {
+        console.error('API call error:', err.message);
+        return { error: err.message };
     }
-    return null;
 }
 
-// Refresh token if needed
+// Login user and get access token
+async function loginUser(email, password) {
+    try {
+        const response = await fetch(`${API_BASE}/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+        });
+        
+        const data = await response.json();
+        
+        if (data.data?.access_token) {
+            return {
+                accessToken: data.data.access_token,
+                user: data.data.user
+            };
+        }
+        return null;
+    } catch (err) {
+        console.error('Login error:', err.message);
+        return null;
+    }
+}
+
+// Refresh user token
 async function refreshUserToken(userId) {
     const user = registeredUsers[userId];
     if (!user) return null;
     
-    // Re-login with stored credentials
     const password = decrypt(user.encryptedPassword);
     const loginResult = await loginUser(user.email, password);
     
     if (loginResult) {
         user.accessToken = loginResult.accessToken;
-        user.tokenExpiry = Date.now() + (23 * 60 * 60 * 1000); // 23 hours
-        return loginResult.accessToken;
+        user.tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+        return user.accessToken;
     }
     return null;
 }
 
-// Get valid access token for user
+// Get valid access token
 async function getValidToken(userId) {
     const user = registeredUsers[userId];
     if (!user) return null;
     
-    // Check if token is expired or missing
     if (!user.accessToken || Date.now() > user.tokenExpiry) {
         return await refreshUserToken(userId);
     }
     return user.accessToken;
 }
 
-// Check for new messages and send SMS alerts
+// Check for new messages and send batched SMS alert
 async function checkUserMessages(userId) {
     const user = registeredUsers[userId];
     if (!user || !user.smsAlertNumber) return;
@@ -107,53 +116,64 @@ async function checkUserMessages(userId) {
         }
         
         const conversations = response.data.results;
+        const newMessages = [];
         
-        // Check each conversation for new messages
+        // Collect all new messages
         for (const conv of conversations) {
             // Skip if this is the alert number (don't notify about own alerts)
-            if (conv.contact?.phone_number === user.smsAlertNumber) continue;
+            if (conv.contact?.phone_number?.replace(/\D/g, '') === user.smsAlertNumber.replace(/\D/g, '')) continue;
             
             // Create unique message key
             const messageKey = `${conv.id}-${conv.last_message_at}-${conv.last_message}`;
             
-            // Check if we've already notified about this message
+            // Initialize lastMessageIds if needed
             if (!user.lastMessageIds) user.lastMessageIds = new Set();
             
+            // Check if this is a new message
             if (!user.lastMessageIds.has(messageKey) && conv.last_message) {
-                // New message! Send SMS alert
-                console.log(`[${userId}] New message from ${conv.contact?.first_name || conv.contact?.phone_number}`);
-                
-                await sendSmsAlert(userId, conv, accessToken);
-                
-                // Track this message
+                newMessages.push(conv);
                 user.lastMessageIds.add(messageKey);
-                
-                // Keep set from growing too large
-                if (user.lastMessageIds.size > 200) {
-                    const arr = Array.from(user.lastMessageIds);
-                    user.lastMessageIds = new Set(arr.slice(-100));
-                }
             }
+        }
+        
+        // Keep set from growing too large
+        if (user.lastMessageIds.size > 200) {
+            const arr = Array.from(user.lastMessageIds);
+            user.lastMessageIds = new Set(arr.slice(-100));
+        }
+        
+        // Send ONE batched SMS if there are new messages
+        if (newMessages.length > 0) {
+            console.log(`[${userId}] ${newMessages.length} new message(s)`);
+            await sendBatchedSmsAlert(userId, newMessages, accessToken);
         }
     } catch (err) {
         console.log(`[${userId}] Error checking messages:`, err.message);
     }
 }
 
-// Send SMS alert
-async function sendSmsAlert(userId, conversation, accessToken) {
+// Send batched SMS alert
+async function sendBatchedSmsAlert(userId, newMessages, accessToken) {
     const user = registeredUsers[userId];
     if (!user) return;
     
     try {
-        const contact = conversation.contact || {};
-        const name = contact.first_name 
-            ? `${contact.first_name} ${contact.last_name || ''}`.trim() 
-            : formatPhone(contact.phone_number) || 'Unknown';
+        let alertText;
         
-        const messagePreview = (conversation.last_message || '').substring(0, 100);
-        const chatLink = `${APP_URL}/?chat=${conversation.id}`;
-        const alertText = `AllTalk Alert - "${name}: ${messagePreview}" Open: ${chatLink}`;
+        if (newMessages.length === 1) {
+            // Single message - show preview
+            const conv = newMessages[0];
+            const contact = conv.contact || {};
+            const name = contact.first_name 
+                ? `${contact.first_name} ${contact.last_name || ''}`.trim() 
+                : formatPhone(contact.phone_number) || 'Unknown';
+            const messagePreview = (conv.last_message || '').substring(0, 80);
+            
+            alertText = `AllTalk Alert\n${name}: "${messagePreview}"\n\nOpen: ${APP_URL}`;
+        } else {
+            // Multiple messages - show count only
+            alertText = `AllTalk Alert\nYou have ${newMessages.length} new messages\n\nOpen: ${APP_URL}`;
+        }
         
         // Find conversation with alert phone number
         const alertConvResponse = await apiCall(`/conversations?search=${user.smsAlertNumber}&limit=5`, accessToken);
@@ -171,7 +191,7 @@ async function sendSmsAlert(userId, conversation, accessToken) {
         }
         
         // Determine which phone number to send FROM
-        let sendFromId = user.smsAlertFromNumberId || alertConv.last_phone_number_id || conversation.last_phone_number_id;
+        let sendFromId = user.smsAlertFromNumberId || alertConv.last_phone_number_id || newMessages[0]?.last_phone_number_id;
         
         if (!sendFromId) {
             console.log(`[${userId}] No phone number available to send SMS alert`);
@@ -191,7 +211,7 @@ async function sendSmsAlert(userId, conversation, accessToken) {
         });
         
         if (sendResponse.message === 'Success' || sendResponse.message?.includes('message_sent') || sendResponse.data) {
-            console.log(`[${userId}] SMS alert sent to ${user.smsAlertNumber}`);
+            console.log(`[${userId}] SMS alert sent to ${user.smsAlertNumber} (${newMessages.length} message(s))`);
         } else {
             console.log(`[${userId}] SMS alert failed:`, sendResponse.message);
         }
@@ -235,7 +255,7 @@ app.post('/api/register', async (req, res) => {
             smsAlertNumber: smsAlertNumber.replace(/\D/g, ''),
             smsAlertFromNumberId,
             accessToken: loginResult.accessToken,
-            tokenExpiry: Date.now() + (23 * 60 * 60 * 1000), // 23 hours
+            tokenExpiry: Date.now() + (23 * 60 * 60 * 1000),
             lastMessageIds: new Set()
         };
         
@@ -277,17 +297,17 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Main polling loop - check all users every 10 seconds
+// Main polling loop - check all users every 15 seconds
 setInterval(async () => {
     const userIds = Object.keys(registeredUsers);
     for (const userId of userIds) {
         await checkUserMessages(userId);
     }
-}, 10000);
+}, 15000);
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`AllTalk Notification Server running on port ${PORT}`);
-    console.log(`Polling interval: 10 seconds`);
+    console.log(`Polling interval: 15 seconds`);
 });
