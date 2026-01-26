@@ -167,12 +167,14 @@ async function sendBatchedSmsAlert(userId, newMessages, accessToken) {
             const name = contact.first_name 
                 ? `${contact.first_name} ${contact.last_name || ''}`.trim() 
                 : formatPhone(contact.phone_number) || 'Unknown';
-            const messagePreview = (conv.last_message || '').substring(0, 80);
+            const messagePreview = (conv.last_message || '').substring(0, 70);
             
-            alertText = `AllTalk Alert\n${name}: "${messagePreview}"\n\nOpen: ${APP_URL}`;
+            // Format: "AllTalk: Name - Message preview\n\nOpen AllTalk\nURL"
+            alertText = `AllTalk: ${name} - ${messagePreview}\n\nOpen AllTalk\n${APP_URL}`;
         } else {
             // Multiple messages - show count only
-            alertText = `AllTalk Alert\nYou have ${newMessages.length} new messages\n\nOpen: ${APP_URL}`;
+            // Format: "AllTalk: You have X new messages\n\nOpen AllTalk\nURL"
+            alertText = `AllTalk: You have ${newMessages.length} new messages\n\nOpen AllTalk\n${APP_URL}`;
         }
         
         // Find conversation with alert phone number
