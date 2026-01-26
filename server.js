@@ -47,17 +47,17 @@ async function apiCall(endpoint, accessToken, options = {}) {
 // Login user and get access token
 async function loginUser(email, password) {
     try {
-        const response = await fetch(`${API_BASE}/auth/login`, {
+        const response = await fetch(`${API_BASE}/auth/sign-in`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password })
+            body: JSON.stringify({ email, password, remember_me: true })
         });
         
         const data = await response.json();
         
-        if (data.data?.access_token) {
+        if (data.data?.tokens?.access_token) {
             return {
-                accessToken: data.data.access_token,
+                accessToken: data.data.tokens.access_token,
                 user: data.data.user
             };
         }
