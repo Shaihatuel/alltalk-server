@@ -10,7 +10,7 @@ app.use(express.json());
 // Encryption key - in production, use environment variable
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'alltalk-secure-key-2024';
 const API_BASE = 'https://api.alltalkpro.com/api/v1';
-const APP_URL = 'https://adorable-monstera-b10a64.netlify.app';
+const APP_URL = 'https://mobile-alltalk.com';
 
 // Store registered users (in production, use a database)
 const registeredUsers = {};
