@@ -110,8 +110,11 @@ async function checkUserMessages(userId) {
         // Get conversations
         const response = await apiCall('/conversations?page=1&limit=50&order=DESC', accessToken);
         
+        // Debug: log the response structure
+        console.log(`[${userId}] API response keys:`, response ? Object.keys(response) : 'null');
+        
         if (!response.data?.results) {
-            console.log(`[${userId}] No conversations found`);
+            console.log(`[${userId}] No conversations found - response.data:`, JSON.stringify(response.data || response).substring(0, 200));
             return;
         }
         
