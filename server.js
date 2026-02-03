@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const CryptoJS = require('crypto-js');
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -12,8 +14,55 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'alltalk-secure-key-2024';
 const API_BASE = 'https://api.alltalkpro.com/api/v1';
 const APP_URL = 'https://mobile-alltalk.com';
 
-// Store registered users (in production, use a database)
-const registeredUsers = {};
+// File path for persistent storage
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'registered-users.json');
+
+// Store registered users (loaded from file on startup)
+let registeredUsers = {};
+
+// Load users from file on startup
+function loadUsers() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const data = fs.readFileSync(DATA_FILE, 'utf8');
+            const parsed = JSON.parse(data);
+            // Convert lastMessageIds arrays back to Sets
+            for (const userId in parsed) {
+                if (parsed[userId].lastMessageIds) {
+                    parsed[userId].lastMessageIds = new Set(parsed[userId].lastMessageIds);
+                }
+            }
+            registeredUsers = parsed;
+            console.log(`Loaded ${Object.keys(registeredUsers).length} registered users from file`);
+        } else {
+            console.log('No existing users file found, starting fresh');
+        }
+    } catch (err) {
+        console.error('Error loading users file:', err.message);
+        registeredUsers = {};
+    }
+}
+
+// Save users to file
+function saveUsers() {
+    try {
+        // Convert Sets to arrays for JSON serialization
+        const toSave = {};
+        for (const userId in registeredUsers) {
+            toSave[userId] = { ...registeredUsers[userId] };
+            if (toSave[userId].lastMessageIds instanceof Set) {
+                toSave[userId].lastMessageIds = Array.from(toSave[userId].lastMessageIds);
+            }
+        }
+        fs.writeFileSync(DATA_FILE, JSON.stringify(toSave, null, 2));
+        console.log(`Saved ${Object.keys(registeredUsers).length} users to file`);
+    } catch (err) {
+        console.error('Error saving users file:', err.message);
+    }
+}
+
+// Load users on startup
+loadUsers();
 
 // Encrypt password
 function encrypt(text) {
@@ -121,10 +170,13 @@ async function checkUserMessages(userId) {
         const conversations = response.data.results;
         const newMessages = [];
         
-        // Collect all new messages
+        // Collect all new INBOUND messages only
         for (const conv of conversations) {
             // Skip if this is the alert number (don't notify about own alerts)
             if (conv.contact?.phone_number?.replace(/\D/g, '') === user.smsAlertNumber.replace(/\D/g, '')) continue;
+            
+            // Only notify for INBOUND messages (unread_count > 0 means contact sent a message)
+            if (conv.unread_count === 0) continue;
             
             // Create unique message key
             const messageKey = `${conv.id}-${conv.last_message_at}-${conv.last_message}`;
@@ -264,6 +316,9 @@ app.post('/api/register', async (req, res) => {
             lastMessageIds: new Set()
         };
         
+        // Save to persistent storage
+        saveUsers();
+        
         console.log(`User registered: ${email} (${userId})`);
         
         res.json({ success: true, message: 'Background alerts enabled', userId });
@@ -279,6 +334,8 @@ app.post('/api/unregister', (req, res) => {
     
     if (userId && registeredUsers[userId]) {
         delete registeredUsers[userId];
+        // Save to persistent storage
+        saveUsers();
         console.log(`User unregistered: ${userId}`);
         res.json({ success: true, message: 'Background alerts disabled' });
     } else {
@@ -302,6 +359,270 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// ============================================
+// PROXY ENDPOINTS - Route app requests through server
+// This prevents the app from creating separate login sessions
+// ============================================
+
+// Middleware to validate user and get token
+async function authenticateUser(req, res, next) {
+    const userId = req.headers['x-user-id'];
+    
+    if (!userId || !registeredUsers[userId]) {
+        return res.status(401).json({ success: false, message: 'User not authenticated. Please register first.' });
+    }
+    
+    try {
+        const accessToken = await getValidToken(userId);
+        if (!accessToken) {
+            return res.status(401).json({ success: false, message: 'Failed to get valid token. Please re-register.' });
+        }
+        
+        req.userId = userId;
+        req.accessToken = accessToken;
+        req.user = registeredUsers[userId];
+        next();
+    } catch (err) {
+        console.error('Auth middleware error:', err.message);
+        res.status(500).json({ success: false, message: 'Authentication error' });
+    }
+}
+
+// Login endpoint - validates credentials and registers user WITHOUT creating conflicts
+// This replaces direct API login from the frontend
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+        return res.status(400).json({ success: false, message: 'Email and password required' });
+    }
+    
+    try {
+        // Check if user already exists by email
+        let existingUserId = null;
+        for (const [id, user] of Object.entries(registeredUsers)) {
+            if (user.email === email) {
+                existingUserId = id;
+                break;
+            }
+        }
+        
+        if (existingUserId) {
+            // User already registered - verify password and return existing session
+            const user = registeredUsers[existingUserId];
+            const storedPassword = decrypt(user.encryptedPassword);
+            
+            if (storedPassword !== password) {
+                return res.status(401).json({ success: false, message: 'Invalid credentials' });
+            }
+            
+            // Get valid token (will refresh if needed, but won't create new login)
+            const accessToken = await getValidToken(existingUserId);
+            
+            if (!accessToken) {
+                // Token refresh failed, need to re-login (this will happen rarely)
+                const loginResult = await loginUser(email, password);
+                if (!loginResult) {
+                    return res.status(401).json({ success: false, message: 'Invalid credentials' });
+                }
+                user.accessToken = loginResult.accessToken;
+                user.tokenExpiry = Date.now() + (23 * 60 * 60 * 1000);
+                saveUsers();
+                
+                return res.json({
+                    success: true,
+                    userId: existingUserId,
+                    user: loginResult.user,
+                    message: 'Login successful (re-authenticated)'
+                });
+            }
+            
+            // Return existing session info
+            console.log(`User login (existing): ${email} (${existingUserId})`);
+            return res.json({
+                success: true,
+                userId: existingUserId,
+                user: { id: existingUserId, email: user.email },
+                message: 'Login successful (existing session)'
+            });
+        }
+        
+        // New user - need to login to AllTalk API once
+        const loginResult = await loginUser(email, password);
+        
+        if (!loginResult) {
+            return res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
+        
+        const userId = loginResult.user.id;
+        
+        // Store user with encrypted password
+        registeredUsers[userId] = {
+            email,
+            encryptedPassword: encrypt(password),
+            smsAlertNumber: '',
+            smsAlertFromNumberId: '',
+            accessToken: loginResult.accessToken,
+            tokenExpiry: Date.now() + (23 * 60 * 60 * 1000),
+            lastMessageIds: new Set()
+        };
+        
+        saveUsers();
+        console.log(`User login (new): ${email} (${userId})`);
+        
+        res.json({
+            success: true,
+            userId: userId,
+            user: loginResult.user,
+            message: 'Login successful'
+        });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Update SMS alert settings (doesn't require re-login)
+app.post('/api/settings', authenticateUser, async (req, res) => {
+    const { smsAlertNumber, smsAlertFromNumberId } = req.body;
+    
+    try {
+        const user = registeredUsers[req.userId];
+        
+        if (smsAlertNumber !== undefined) {
+            user.smsAlertNumber = smsAlertNumber.replace(/\D/g, '');
+        }
+        if (smsAlertFromNumberId !== undefined) {
+            user.smsAlertFromNumberId = smsAlertFromNumberId;
+        }
+        
+        saveUsers();
+        
+        res.json({ 
+            success: true, 
+            message: 'Settings updated',
+            smsAlertNumber: user.smsAlertNumber,
+            smsAlertFromNumberId: user.smsAlertFromNumberId
+        });
+    } catch (err) {
+        console.error('Settings update error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Get user settings
+app.get('/api/settings', authenticateUser, async (req, res) => {
+    const user = registeredUsers[req.userId];
+    res.json({
+        success: true,
+        smsAlertNumber: user.smsAlertNumber || '',
+        smsAlertFromNumberId: user.smsAlertFromNumberId || '',
+        email: user.email
+    });
+});
+
+// Proxy: Get conversations
+app.get('/api/proxy/conversations', authenticateUser, async (req, res) => {
+    try {
+        const queryString = req.url.includes('?') ? req.url.split('?')[1] : 'page=1&limit=50&order=DESC';
+        const response = await apiCall(`/conversations?${queryString}`, req.accessToken);
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy conversations error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Get messages for a conversation
+app.get('/api/proxy/conversations/:convId/messages/:phoneId', authenticateUser, async (req, res) => {
+    try {
+        const { convId, phoneId } = req.params;
+        const limit = req.query.limit || 50;
+        const response = await apiCall(`/conversations/${convId}/messages/${phoneId}?limit=${limit}`, req.accessToken);
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy messages error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Send message
+app.post('/api/proxy/conversations/:convId/messages', authenticateUser, async (req, res) => {
+    try {
+        const { convId } = req.params;
+        const response = await apiCall(`/conversations/${convId}/messages`, req.accessToken, {
+            method: 'POST',
+            body: JSON.stringify(req.body)
+        });
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy send message error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Mark conversation as read
+app.post('/api/proxy/conversations/:convId/read', authenticateUser, async (req, res) => {
+    try {
+        const { convId } = req.params;
+        const response = await apiCall(`/conversations/${convId}/read`, req.accessToken, {
+            method: 'POST'
+        });
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy mark read error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Get phone numbers
+app.get('/api/proxy/phone-numbers', authenticateUser, async (req, res) => {
+    try {
+        const limit = req.query.limit || 50;
+        const response = await apiCall(`/phone-numbers?limit=${limit}`, req.accessToken);
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy phone numbers error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Get contact details
+app.get('/api/proxy/contacts/:contactId', authenticateUser, async (req, res) => {
+    try {
+        const { contactId } = req.params;
+        const response = await apiCall(`/contacts/${contactId}`, req.accessToken);
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy contact error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Proxy: Search conversations
+app.get('/api/proxy/conversations/search', authenticateUser, async (req, res) => {
+    try {
+        const search = req.query.search || '';
+        const limit = req.query.limit || 10;
+        const response = await apiCall(`/conversations?search=${encodeURIComponent(search)}&limit=${limit}`, req.accessToken);
+        res.json(response);
+    } catch (err) {
+        console.error('Proxy search error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Logout - removes user from server (optional - keeps background alerts if desired)
+app.post('/api/logout', (req, res) => {
+    const userId = req.headers['x-user-id'];
+    
+    // Note: We don't delete the user from registeredUsers
+    // This allows background SMS alerts to continue working
+    // User can explicitly disable alerts via /api/unregister
+    
+    res.json({ success: true, message: 'Logged out from app' });
+});
+
 // Main polling loop - check all users every 15 seconds
 setInterval(async () => {
     const userIds = Object.keys(registeredUsers);
@@ -315,4 +636,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`AllTalk Notification Server running on port ${PORT}`);
     console.log(`Polling interval: 15 seconds`);
+    console.log(`Proxy endpoints enabled - app will not create separate sessions`);
 });
