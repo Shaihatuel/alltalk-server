@@ -14,6 +14,9 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'alltalk-secure-key-2024';
 const API_BASE = 'https://api.alltalkpro.com/api/v1';
 const APP_URL = 'https://mobile-alltalk.com';
 
+// Polling interval in milliseconds (5 seconds for faster notifications)
+const POLLING_INTERVAL = 5000;
+
 // File path for persistent storage
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'registered-users.json');
 
@@ -144,7 +147,49 @@ async function getValidToken(userId) {
     return user.accessToken;
 }
 
-// Check for new messages and send batched SMS alert
+// Fetch user's stop triggers (opt-out keywords)
+async function fetchStopTriggers(userId) {
+    const user = registeredUsers[userId];
+    if (!user) return [];
+    
+    try {
+        const accessToken = await getValidToken(userId);
+        if (!accessToken) return [];
+        
+        const response = await apiCall('/settings/stop-trigger?limit=100', accessToken);
+        
+        if (response.data?.results) {
+            const triggers = response.data.results.map(t => t.name.toLowerCase());
+            user.stopTriggers = triggers;
+            saveUsers();
+            console.log(`[${userId}] Loaded ${triggers.length} stop triggers:`, triggers);
+            return triggers;
+        }
+        return [];
+    } catch (err) {
+        console.log(`[${userId}] Error fetching stop triggers:`, err.message);
+        return user.stopTriggers || [];
+    }
+}
+
+// Check if message contains opt-out language
+function containsOptOut(message, stopTriggers) {
+    if (!message || !stopTriggers || stopTriggers.length === 0) return false;
+    
+    const messageLower = message.toLowerCase().trim();
+    
+    for (const trigger of stopTriggers) {
+        // Check for exact match or word boundary match
+        const triggerLower = trigger.toLowerCase();
+        const regex = new RegExp(`\\b${triggerLower}\\b`, 'i');
+        if (regex.test(messageLower)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check for new messages and send SMS alerts
 async function checkUserMessages(userId) {
     const user = registeredUsers[userId];
     if (!user || !user.smsAlertNumber) return;
@@ -156,21 +201,22 @@ async function checkUserMessages(userId) {
             return;
         }
         
+        // Refresh stop triggers periodically (every 5 minutes)
+        if (!user.lastTriggerFetch || Date.now() - user.lastTriggerFetch > 300000) {
+            await fetchStopTriggers(userId);
+            user.lastTriggerFetch = Date.now();
+        }
+        
         // Get conversations
         const response = await apiCall('/conversations?page=1&limit=50&order=DESC', accessToken);
         
-        // Debug: log the response structure
-        console.log(`[${userId}] API response keys:`, response ? Object.keys(response) : 'null');
-        
         if (!response.data?.results) {
-            console.log(`[${userId}] No conversations found - response.data:`, JSON.stringify(response.data || response).substring(0, 200));
             return;
         }
         
         const conversations = response.data.results;
-        const newMessages = [];
         
-        // Collect all new INBOUND messages only
+        // Process each conversation for new INBOUND messages
         for (const conv of conversations) {
             // Skip if this is the alert number (don't notify about own alerts)
             if (conv.contact?.phone_number?.replace(/\D/g, '') === user.smsAlertNumber.replace(/\D/g, '')) continue;
@@ -186,8 +232,16 @@ async function checkUserMessages(userId) {
             
             // Check if this is a new message
             if (!user.lastMessageIds.has(messageKey) && conv.last_message) {
-                newMessages.push(conv);
                 user.lastMessageIds.add(messageKey);
+                
+                // Check for opt-out language using user's specific stop triggers
+                if (containsOptOut(conv.last_message, user.stopTriggers || [])) {
+                    console.log(`[${userId}] Skipping opt-out message: "${conv.last_message.substring(0, 30)}..."`);
+                    continue;
+                }
+                
+                // Send individual SMS alert for this message
+                await sendSmsAlert(userId, conv, accessToken);
             }
         }
         
@@ -196,41 +250,24 @@ async function checkUserMessages(userId) {
             const arr = Array.from(user.lastMessageIds);
             user.lastMessageIds = new Set(arr.slice(-100));
         }
-        
-        // Send ONE batched SMS if there are new messages
-        if (newMessages.length > 0) {
-            console.log(`[${userId}] ${newMessages.length} new message(s)`);
-            await sendBatchedSmsAlert(userId, newMessages, accessToken);
-        }
     } catch (err) {
         console.log(`[${userId}] Error checking messages:`, err.message);
     }
 }
 
-// Send batched SMS alert
-async function sendBatchedSmsAlert(userId, newMessages, accessToken) {
+// Send individual SMS alert for a single message
+async function sendSmsAlert(userId, conv, accessToken) {
     const user = registeredUsers[userId];
     if (!user) return;
     
     try {
-        let alertText;
+        const contact = conv.contact || {};
+        const name = contact.first_name 
+            ? `${contact.first_name} ${contact.last_name || ''}`.trim() 
+            : formatPhone(contact.phone_number) || 'Unknown';
+        const messagePreview = (conv.last_message || '').substring(0, 70);
         
-        if (newMessages.length === 1) {
-            // Single message - show preview
-            const conv = newMessages[0];
-            const contact = conv.contact || {};
-            const name = contact.first_name 
-                ? `${contact.first_name} ${contact.last_name || ''}`.trim() 
-                : formatPhone(contact.phone_number) || 'Unknown';
-            const messagePreview = (conv.last_message || '').substring(0, 70);
-            
-            // Format: "AllTalk: Name - Message preview\n\nOpen AllTalk\nURL"
-            alertText = `AllTalk: ${name} - ${messagePreview}\n\nOpen AllTalk\n${APP_URL}`;
-        } else {
-            // Multiple messages - show count only
-            // Format: "AllTalk: You have X new messages\n\nOpen AllTalk\nURL"
-            alertText = `AllTalk: You have ${newMessages.length} new messages\n\nOpen AllTalk\n${APP_URL}`;
-        }
+        const alertText = `AllTalk: ${name} - ${messagePreview}\n\nOpen AllTalk\n${APP_URL}`;
         
         // Find conversation with alert phone number
         const alertConvResponse = await apiCall(`/conversations?search=${user.smsAlertNumber}&limit=5`, accessToken);
@@ -248,7 +285,7 @@ async function sendBatchedSmsAlert(userId, newMessages, accessToken) {
         }
         
         // Determine which phone number to send FROM
-        let sendFromId = user.smsAlertFromNumberId || alertConv.last_phone_number_id || newMessages[0]?.last_phone_number_id;
+        let sendFromId = user.smsAlertFromNumberId || alertConv.last_phone_number_id || conv.last_phone_number_id;
         
         if (!sendFromId) {
             console.log(`[${userId}] No phone number available to send SMS alert`);
@@ -268,7 +305,7 @@ async function sendBatchedSmsAlert(userId, newMessages, accessToken) {
         });
         
         if (sendResponse.message === 'Success' || sendResponse.message?.includes('message_sent') || sendResponse.data) {
-            console.log(`[${userId}] SMS alert sent to ${user.smsAlertNumber} (${newMessages.length} message(s))`);
+            console.log(`[${userId}] SMS alert sent: ${name} - "${messagePreview.substring(0, 20)}..."`);
         } else {
             console.log(`[${userId}] SMS alert failed:`, sendResponse.message);
         }
@@ -470,6 +507,9 @@ app.post('/api/login', async (req, res) => {
         saveUsers();
         console.log(`User login (new): ${email} (${userId})`);
         
+        // Fetch user's stop triggers
+        await fetchStopTriggers(userId);
+        
         res.json({
             success: true,
             userId: userId,
@@ -517,8 +557,24 @@ app.get('/api/settings', authenticateUser, async (req, res) => {
         success: true,
         smsAlertNumber: user.smsAlertNumber || '',
         smsAlertFromNumberId: user.smsAlertFromNumberId || '',
-        email: user.email
+        email: user.email,
+        stopTriggers: user.stopTriggers || []
     });
+});
+
+// Refresh stop triggers for a user
+app.post('/api/refresh-triggers', authenticateUser, async (req, res) => {
+    try {
+        const triggers = await fetchStopTriggers(req.userId);
+        res.json({
+            success: true,
+            message: `Loaded ${triggers.length} stop triggers`,
+            stopTriggers: triggers
+        });
+    } catch (err) {
+        console.error('Refresh triggers error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
 // Proxy: Get conversations
@@ -623,18 +679,19 @@ app.post('/api/logout', (req, res) => {
     res.json({ success: true, message: 'Logged out from app' });
 });
 
-// Main polling loop - check all users every 15 seconds
+// Main polling loop - check all users every 5 seconds
 setInterval(async () => {
     const userIds = Object.keys(registeredUsers);
     for (const userId of userIds) {
         await checkUserMessages(userId);
     }
-}, 15000);
+}, POLLING_INTERVAL);
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`AllTalk Notification Server running on port ${PORT}`);
-    console.log(`Polling interval: 15 seconds`);
+    console.log(`Polling interval: ${POLLING_INTERVAL / 1000} seconds`);
     console.log(`Proxy endpoints enabled - app will not create separate sessions`);
+    console.log(`Opt-out filtering enabled - per-user stop triggers`);
 });
